@@ -26,10 +26,12 @@ import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import javax.servlet.AsyncContext;
+import javax.servlet.AsyncEvent;
+import javax.servlet.AsyncListener;
 import javax.servlet.ServletException;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
@@ -81,7 +83,7 @@ public class ThreadLimitHandler extends HandlerWrapper
     private final boolean _rfc7239;
     private final String _forwardedHeader;
     private final IncludeExcludeSet<String, InetAddress> _includeExcludeSet = new IncludeExcludeSet<>(InetAddressSet.class);
-    private final ConcurrentMap<String, Remote> _remotes = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Remote> _remotes = new ConcurrentHashMap<>();
     private volatile boolean _enabled;
     private int _threadLimit=10;
 
@@ -167,6 +169,10 @@ public class ThreadLimitHandler extends HandlerWrapper
             }
             else
             {
+                // Is the request suspended waiting for a permit? If so, it keeps its
+                // reference to the Remote until it is redispatched or completed.
+                boolean suspended = false;
+
                 // Do we already have a future permit from a previous invocation?
                 Closeable permit = (Closeable)baseRequest.getAttribute(PERMIT);
                 try
@@ -197,12 +203,17 @@ public class ThreadLimitHandler extends HandlerWrapper
                             // then give them maximum time to get a thread.
                             async.setTimeout(0);
 
+                            // release the reference to the Remote if the request completes
+                            // without being redispatched through this handler.
+                            async.addListener(new RemoteReleaseListener(baseRequest,remote));
+
                             // dispatch the request when we do eventually get a pass
                             future_permit.thenAccept(c->
                             {
                                 baseRequest.setAttribute(PERMIT,c);
                                 async.dispatch();
                             });
+                            suspended = true;
                             return;
                         }
                     }
@@ -216,8 +227,18 @@ public class ThreadLimitHandler extends HandlerWrapper
                 }
                 finally
                 {
-                    if (permit!=null)
-                        permit.close();
+                    try
+                    {
+                        if (permit!=null)
+                            permit.close();
+                    }
+                    finally
+                    {
+                        // Release the reference to the Remote held by this request, so that
+                        // Remote instances do not accumulate without bound.
+                        if (!suspended)
+                            releaseRemote(baseRequest,remote);
+                    }
                 }
             }
         }
@@ -258,20 +279,44 @@ public class ThreadLimitHandler extends HandlerWrapper
         if (limit<=0)
             return null;
 
-        remote = _remotes.get(ip);
-        if (remote==null)
+        // Use a compute method to create or retain the Remote instance as it is necessary for
+        // the ref counter increment or the instance creation to be mutually exclusive.
+        // The map MUST be a CHM as it guarantees the remapping function is only called once.
+        remote = _remotes.compute(ip,(k,v)->
         {
-            Remote r = new Remote(ip,limit);
-            remote = _remotes.putIfAbsent(ip,r);
-            if (remote==null)
-                remote = r;
-        }
-        
+            if (v!=null)
+            {
+                v._referenceCounter.retain();
+                return v;
+            }
+            return new Remote(k,limit);
+        });
+
         baseRequest.setAttribute(REMOTE,remote);
 
         return remote;
     }
-    
+
+    /**
+     * Release the reference to a {@link Remote} held by a request, removing
+     * the {@link Remote} once it is no longer referenced by any request.
+     * The reference is released at most once per request.
+     *
+     * @param baseRequest the request holding the reference
+     * @param remote the remote to release
+     */
+    private void releaseRemote(Request baseRequest, Remote remote)
+    {
+        // Only release if the request still holds the reference and the Remote is tracked by this handler.
+        if (baseRequest.getAttribute(REMOTE)!=remote || _remotes.get(remote._ip)!=remote)
+            return;
+        baseRequest.removeAttribute(REMOTE);
+
+        // Use a compute method to remove the Remote instance as it is necessary for
+        // the ref counter release and the removal to be atomic.
+        _remotes.computeIfPresent(remote._ip,(k,v)->v==remote && v._referenceCounter.release()?null:v);
+    }
+
     
     protected String getRemoteIP(Request baseRequest)
     {
@@ -328,12 +373,17 @@ public class ThreadLimitHandler extends HandlerWrapper
         return (comma>=0)?forwarded_for.substring(comma+1).trim():forwarded_for;
     }
 
+    int getRemoteCount()
+    {
+        return _remotes.size();
+    }
 
     private final class Remote implements Closeable
     {
         private final String _ip;
         private final int _limit;
         private final Locker _locker = new Locker();
+        private final ReferenceCounter _referenceCounter = new ReferenceCounter();
         private int _permits;
         private Deque<CompletableFuture<Closeable>> _queue = new ArrayDeque<>();
         private final CompletableFuture<Closeable> _permitted = CompletableFuture.completedFuture(this);
@@ -400,6 +450,64 @@ public class ThreadLimitHandler extends HandlerWrapper
             {
                 return String.format("R[ip=%s,p=%d,l=%d,q=%d]",_ip,_permits,_limit,_queue.size());
             }
+        }
+    }
+
+    private final class RemoteReleaseListener implements AsyncListener
+    {
+        private final Request _baseRequest;
+        private final Remote _remote;
+
+        private RemoteReleaseListener(Request baseRequest, Remote remote)
+        {
+            _baseRequest = baseRequest;
+            _remote = remote;
+        }
+
+        @Override
+        public void onComplete(AsyncEvent event)
+        {
+            releaseRemote(_baseRequest,_remote);
+        }
+
+        @Override
+        public void onTimeout(AsyncEvent event)
+        {
+        }
+
+        @Override
+        public void onError(AsyncEvent event)
+        {
+        }
+
+        @Override
+        public void onStartAsync(AsyncEvent event)
+        {
+            // Keep listening if the request is suspended again while still holding its reference.
+            if (_baseRequest.getAttribute(REMOTE)==_remote)
+                event.getAsyncContext().addListener(this);
+        }
+    }
+
+    private static class ReferenceCounter
+    {
+        private final AtomicInteger references = new AtomicInteger(1);
+
+        public void retain()
+        {
+            if (references.getAndUpdate(c->c==0?0:c+1)==0)
+                throw new IllegalStateException("released "+this);
+        }
+
+        public boolean release()
+        {
+            int ref = references.updateAndGet(c->
+            {
+                if (c==0)
+                    throw new IllegalStateException("already released "+this);
+                return c-1;
+            });
+            return ref==0;
         }
     }
 

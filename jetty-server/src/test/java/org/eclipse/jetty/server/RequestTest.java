@@ -1599,6 +1599,234 @@ public class RequestTest
         }
     }
 
+    @Test
+    public void testMultiPartFormTooManyParts() throws Exception
+    {
+        try (StacklessLogging stackless = new StacklessLogging(HttpChannel.class))
+        {
+            _server.setAttribute("org.eclipse.jetty.server.Request.maxFormKeys",10);
+            _handler._checker = new MultiPartParametersTester(11);
+
+            HttpTester.Response response = HttpTester.parseResponse(_connector.getResponses(multiPartFormRequest("/",11,"x")));
+            assertThat("Response.status", response.getStatus(), is(400));
+            assertThat("Response body content", response.getContent(),containsString("Unable to parse form content"));
+            assertThat("Response body content", response.getContent(),containsString("Form with too many parts"));
+        }
+    }
+
+    @Test
+    public void testMultiPartFormPartsAtLimit() throws Exception
+    {
+        _server.setAttribute("org.eclipse.jetty.server.Request.maxFormKeys",10);
+        _handler._checker = new MultiPartParametersTester(10);
+
+        HttpTester.Response response = HttpTester.parseResponse(_connector.getResponses(multiPartFormRequest("/",10,"x")));
+        assertThat("Response.status", response.getStatus(), is(200));
+    }
+
+    @Test
+    public void testMultiPartFormTooManyPartsDefaultLimit() throws Exception
+    {
+        try (StacklessLogging stackless = new StacklessLogging(HttpChannel.class))
+        {
+            // No context and no server attributes, so the default maxFormKeys of 1000 applies.
+            _handler._checker = new MultiPartParametersTester(1001);
+
+            HttpTester.Response response = HttpTester.parseResponse(_connector.getResponses(multiPartFormRequest("/",1001,"x")));
+            assertThat("Response.status", response.getStatus(), is(400));
+            assertThat("Response body content", response.getContent(),containsString("Unable to parse form content"));
+            assertThat("Response body content", response.getContent(),containsString("Form with too many parts"));
+        }
+    }
+
+    @Test
+    public void testMultiPartFormTooManyPartsContextLimit() throws Exception
+    {
+        try (StacklessLogging stackless = new StacklessLogging(HttpChannel.class))
+        {
+            _server.stop();
+            ContextHandler contextHandler = new ContextHandler();
+            contextHandler.setContextPath("/ctx");
+            contextHandler.setMaxFormKeys(5);
+            contextHandler.setHandler(_handler);
+            _server.setHandler(contextHandler);
+            _server.start();
+            _handler._checker = new MultiPartParametersTester(6);
+
+            HttpTester.Response response = HttpTester.parseResponse(_connector.getResponses(multiPartFormRequest("/ctx/",6,"x")));
+            assertThat("Response.status", response.getStatus(), is(400));
+            assertThat("Response body content", response.getContent(),containsString("Unable to parse form content"));
+            assertThat("Response body content", response.getContent(),containsString("Form with too many parts"));
+        }
+    }
+
+    @Test
+    public void testMultiPartGetPartsTooManyParts() throws Exception
+    {
+        _server.setAttribute("org.eclipse.jetty.server.Request.maxFormKeys",10);
+        final File tmpDir = multiPartTestingDir();
+        _handler._checker = new RequestTester()
+        {
+            @Override
+            public boolean check(HttpServletRequest request,HttpServletResponse response) throws IOException
+            {
+                request.setAttribute(Request.__MULTIPART_CONFIG_ELEMENT, new MultipartConfigElement(tmpDir.getAbsolutePath(),-1,-1,1024));
+                try
+                {
+                    request.getParts();
+                    return false;
+                }
+                catch (IllegalStateException e)
+                {
+                    return e.getMessage().startsWith("Form with too many parts");
+                }
+                catch (ServletException e)
+                {
+                    return false;
+                }
+            }
+        };
+
+        HttpTester.Response response = HttpTester.parseResponse(_connector.getResponses(multiPartFormRequest("/",11,"x")));
+        assertThat("Response.status", response.getStatus(), is(200));
+    }
+
+    @Test
+    public void testMultiPartFormContentTooLarge() throws Exception
+    {
+        try (StacklessLogging stackless = new StacklessLogging(HttpChannel.class))
+        {
+            // Each part is below the limit, but the total size of the form parts exceeds it.
+            _server.setAttribute("org.eclipse.jetty.server.Request.maxFormContentSize",100);
+            _handler._checker = new MultiPartParametersTester(2);
+
+            char[] value = new char[60];
+            Arrays.fill(value,'x');
+            HttpTester.Response response = HttpTester.parseResponse(_connector.getResponses(multiPartFormRequest("/",2,new String(value))));
+            assertThat("Response.status", response.getStatus(), is(400));
+            assertThat("Response body content", response.getContent(),containsString("Unable to parse form content"));
+            assertThat("Response body content", response.getContent(),containsString("Form is larger than max length 100"));
+        }
+    }
+
+    @Test
+    public void testMultiPartFormContentTooLargeDefaultLimit() throws Exception
+    {
+        try (StacklessLogging stackless = new StacklessLogging(HttpChannel.class))
+        {
+            // No context and no server attributes, so the default maxFormContentSize of 200000 applies.
+            _handler._checker = new MultiPartParametersTester(1);
+
+            char[] value = new char[200001];
+            Arrays.fill(value,'x');
+            HttpTester.Response response = HttpTester.parseResponse(_connector.getResponses(multiPartFormRequest("/",1,new String(value))));
+            assertThat("Response.status", response.getStatus(), is(400));
+            assertThat("Response body content", response.getContent(),containsString("Unable to parse form content"));
+            assertThat("Response body content", response.getContent(),containsString("Form is larger than max length 200000"));
+        }
+    }
+
+    @Test
+    public void testMultiPartFileContentNotLimitedByMaxFormContentSize() throws Exception
+    {
+        // Parts with a filename are not form parameters, so they do not count towards maxFormContentSize.
+        _server.setAttribute("org.eclipse.jetty.server.Request.maxFormContentSize",100);
+        final File tmpDir = multiPartTestingDir();
+        _handler._checker = new RequestTester()
+        {
+            @Override
+            public boolean check(HttpServletRequest request,HttpServletResponse response) throws IOException
+            {
+                request.setAttribute(Request.__MULTIPART_CONFIG_ELEMENT, new MultipartConfigElement(tmpDir.getAbsolutePath(),-1,-1,1024));
+                try
+                {
+                    Part upload = request.getPart("upload");
+                    return "Joe Blow".equals(request.getParameter("field1")) && upload != null && upload.getSize() == 200;
+                }
+                catch (ServletException e)
+                {
+                    return false;
+                }
+            }
+        };
+
+        char[] value = new char[200];
+        Arrays.fill(value,'0');
+        String multipart =  "--AaB03x\r\n"+
+            "content-disposition: form-data; name=\"field1\"\r\n"+
+            "\r\n"+
+            "Joe Blow\r\n"+
+            "--AaB03x\r\n"+
+            "content-disposition: form-data; name=\"upload\"; filename=\"foo.upload\"\r\n"+
+            "Content-Type: text/plain;charset=ISO-8859-1\r\n"+
+            "\r\n"+
+            new String(value)+"\r\n"+
+            "--AaB03x--\r\n";
+
+        String request="POST / HTTP/1.1\r\n"+
+            "Host: whatever\r\n"+
+            "Content-Type: multipart/form-data; boundary=\"AaB03x\"\r\n"+
+            "Content-Length: "+multipart.getBytes().length+"\r\n"+
+            "Connection: close\r\n"+
+            "\r\n"+
+            multipart;
+
+        HttpTester.Response response = HttpTester.parseResponse(_connector.getResponses(request));
+        assertThat("Response.status", response.getStatus(), is(200));
+    }
+
+    private static File multiPartTestingDir()
+    {
+        File tmpDir = MavenTestingUtils.getTargetTestingDir("multipart-limits");
+        FS.ensureEmpty(tmpDir);
+        return tmpDir;
+    }
+
+    private static String multiPartFormRequest(String uri, int numParts, String value)
+    {
+        StringBuilder multipart = new StringBuilder();
+        for (int i=0;i<numParts;i++)
+        {
+            multipart.append("--AaB03x\r\n")
+                .append("content-disposition: form-data; name=\"part").append(i).append("\"\r\n")
+                .append("\r\n")
+                .append(value).append("\r\n");
+        }
+        multipart.append("--AaB03x--\r\n");
+
+        return "POST "+uri+" HTTP/1.1\r\n"+
+            "Host: whatever\r\n"+
+            "Content-Type: multipart/form-data; boundary=\"AaB03x\"\r\n"+
+            "Content-Length: "+multipart.toString().getBytes(StandardCharsets.ISO_8859_1).length+"\r\n"+
+            "Connection: close\r\n"+
+            "\r\n"+
+            multipart;
+    }
+
+    private static class MultiPartParametersTester implements RequestTester
+    {
+        private final File _tmpDir = multiPartTestingDir();
+        private final int _numParts;
+
+        private MultiPartParametersTester(int numParts)
+        {
+            _numParts = numParts;
+        }
+
+        @Override
+        public boolean check(HttpServletRequest request,HttpServletResponse response)
+        {
+            // Fake a MultiPartConfig'd servlet endpoint
+            request.setAttribute(Request.__MULTIPART_CONFIG_ELEMENT, new MultipartConfigElement(_tmpDir.getAbsolutePath(),-1,-1,1024));
+            for (int i=0;i<_numParts;i++)
+            {
+                if (request.getParameter("part"+i) == null)
+                    return false;
+            }
+            return true;
+        }
+    }
+
     @Test(expected = UnsupportedEncodingException.class)
     public void testNotSupportedCharacterEncoding() throws UnsupportedEncodingException
     {
